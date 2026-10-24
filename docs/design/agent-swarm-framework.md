@@ -127,9 +127,14 @@ A **project** groups tasks into something with context:
   names), surfaced to drones inside every task of the project
 - `labels` — for filtering and for scheduler matching hints
 
-Tasks always belong to a project (`Task.project_id`). Operators create
-projects and submit goals/tasks within them; drones see the project context
-when executing. Projects are stored through the `TaskStore` port like tasks.
+The contract **enforces that every task belongs to a project**: `Task` and
+`SubmitTaskRequest` carry a `project_id` that is required — declared with
+`buf.validate` (`min_len: 1`) so generated validation code rejects a task
+without a project at the API boundary, and the mind additionally validates it
+server-side (referential check against the `TaskStore`). Tasks can never exist
+outside a project. Operators create projects and submit goals/tasks within
+them; drones see the project context when executing. Projects are stored
+through the `TaskStore` port like tasks.
 
 ## 4. Shared contract (protobuf)
 
@@ -137,7 +142,7 @@ One contract, one module, versioned:
 
 ```
 proto/holism/v1/
-├── common.proto     # Project, Task, TaskSpec, TaskResult, TaskStatus, Ack, Artifact (keep minimal)
+├── common.proto     # Project, Task (project_id required), TaskSpec, Capability, TaskResult, TaskStatus, Ack, Artifact (keep minimal)
 ├── events.proto     # Event envelope for SubscribeEvents
 └── mind.proto       # MindService — the swarm's single gRPC API
 ```
@@ -162,10 +167,10 @@ service MindService {
   rpc GetProject(GetProjectRequest) returns (Project);
   rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
 
-  // --- tasks (scoped to a project) ---
-  rpc SubmitTask(SubmitTaskRequest) returns (Task);   // submit a goal or a task into a project
+  // --- tasks (every task lives inside a project) ---
+  rpc SubmitTask(SubmitTaskRequest) returns (Task);   // project_id is required (buf.validate)
   rpc GetTask(GetTaskRequest) returns (Task);
-  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);  // filter by project, status, …
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);  // project_id required in the filter
   rpc CancelTask(CancelTaskRequest) returns (Task);
 
   // --- observability ---
@@ -211,11 +216,15 @@ message MindMessage {             // mind → drone
 Payload messages (in `common.proto`):
 
 ```proto
+message Capability {              // an agent skill, declared at registration
+  string name = 1;                 // short name, e.g. "tool:kubectl"
+  string description = 2;          // what the skill actually does, in detail
+}
+
 message Register {
   string drone_id = 1;
-  repeated string labels = 2;        // free-form, e.g. "gpu", "region:eu"
-  repeated string capabilities = 3;  // agent skills, e.g. "tool:kubectl",
-                                     // "vcs:git-push", "vcs:sign-commits"
+  repeated string labels = 2;         // free-form, e.g. "gpu", "region:eu"
+  repeated Capability capabilities = 3;
 }
 
 message TaskAck {                 // drone → mind, acks a submitted Task
@@ -300,20 +309,24 @@ after lease expiry (heartbeats renew the lease).
 
 ### 4.3 Capabilities (agent skills)
 
-Agents declare their **capabilities** at registration — free-form strings
-describing what the agent can do, e.g.:
+Agents declare their **capabilities** at registration. A capability is a
+**short name** plus a **detailed description** of what the skill does:
 
-- `tool:kubectl` — can run kubectl against a cluster
-- `vcs:git-push` — can push branches / open PRs
-- `vcs:sign-commits` — can sign commits
-- `notify:slack` — can post to Slack
+| Name (short) | Description (example) |
+|---|---|
+| `tool:kubectl` | Can run `kubectl` against the production cluster (read and apply) |
+| `vcs:git-push` | Can push branches and open pull requests on the org's GitHub repos |
+| `vcs:sign-commits` | Can sign commits with the team's GPG/SSH signing key |
+| `notify:slack` | Can post messages to the `#eng-alerts` Slack channel |
 
-A task's `TaskSpec.required_capabilities` lists the skills it needs. The
-scheduler only submits a task to a READY drone whose declared capabilities are a
-superset of the required ones (in addition to label matching). Capabilities are
-compared as exact strings; namespacing by prefix (`tool:`, `vcs:`, …) is a
-convention, not enforced by the contract. An empty `required_capabilities` means
-any drone may run the task.
+The name is the machine-comparable handle: a task's
+`TaskSpec.required_capabilities` lists capability **names**, and the scheduler
+only submits a task to a READY drone whose declared capability names are a
+superset of the required ones (in addition to label matching). The description
+is human/agent-facing — it lets a planner (or a human) understand what a skill
+entails when decomposing goals or choosing drones. Namespacing by prefix
+(`tool:`, `vcs:`, …) is a convention, not enforced by the contract. An empty
+`required_capabilities` means any drone may run the task.
 
 ### 4.4 Task lifecycle
 
@@ -343,8 +356,8 @@ queued ──► assigned ──► running ──► succeeded
 
 - **Planner** (`Planner` port): turns a project's goal into an ordered set of
   `TaskSpec`s (initially rule-based; LLM-based planner is a drop-in adapter),
-  assigning each task the `required_capabilities` it needs. The planner itself
-  may use a knowledge harness to ground its plans.
+  assigning each task the `required_capabilities` (names) it needs. The planner
+  itself may use a knowledge harness to ground its plans.
 - **Scheduler**: watches the `TaskStore` for `queued` tasks and the registry for
   READY drones; submits `Task` messages onto the chosen drone's stream and
   tracks pending acks. Matches on labels **and capabilities**. Owns dispatch
@@ -365,8 +378,9 @@ queued ──► assigned ──► running ──► succeeded
 ### 5.2 Drone
 
 - **Mind client**: dials the mind, opens the `Connect` bidi stream, sends
-  `Register` (id, labels, **capabilities**), then heartbeats. Reconnects with
-  backoff on stream failure and re-registers with the same identity.
+  `Register` (id, labels, **capabilities** with names and descriptions), then
+  heartbeats. Reconnects with backoff on stream failure and re-registers with
+  the same identity.
 - **Inbound loop**: reads `MindMessage`s from the stream — `Task` (validate
   capacity, reply `TaskAck`; deduplicate by `task_id`), `Cancel`, `Drain`
   (finish in-flight work, send `Bye`, exit).
@@ -518,9 +532,9 @@ Open questions that remain:
   and executes submitted tasks.
 - **Project**: a group of tasks with shared context (goal, description,
   labels); the unit the planner decomposes.
-- **Capability**: an agent skill declared at registration (e.g. `tool:kubectl`,
-  `vcs:git-push`); tasks declare required capabilities and the scheduler matches
-  them.
+- **Capability**: an agent skill declared at registration — a short name (e.g.
+  `tool:kubectl`, `vcs:git-push`) plus a detailed description; tasks declare
+  required capability names and the scheduler matches them.
 - **Port**: a small Go interface hiding an external dependency.
 - **Adapter**: a concrete implementation of a port.
 - **Contract**: the versioned protobuf module shared by all components.
