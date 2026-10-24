@@ -13,16 +13,20 @@ Objectives:
 1. **Simple, replaceable pieces.** Every external dependency (task storage,
    event transport, planning, execution) sits behind a small Go interface (a
    *port*). Swapping an implementation must not require touching the
-   coordinator or the drones' business logic.
+   coordinator or the drones' business logic. Ports may be backed by Holism's
+   own infrastructure **or delegated to external systems** (e.g. tasks stored as
+   Linear tickets, events delivered to a Slack channel).
 2. **Portability.** Each component ships as its own Docker container and can be
    orchestrated by any runtime that can start containers and give them outbound
    network access (Docker Compose locally, Nomad, a plain VM fleet, …). No
    component assumes a specific host, network, orchestrator, or cloud.
 3. **Two actors.**
-   - **Mind** — the central coordinator. It decomposes goals into tasks, submits
-     tasks to drones, tracks progress, and retries or re-plans on failure.
+   - **Mind** — the central coordinator. It decomposes project goals into tasks,
+     submits tasks to drones, tracks progress, and retries or re-plans on
+     failure.
    - **Drone** — a worker. It connects to the mind, declares itself able to
-     receive tasks, executes them, and reports progress and results.
+     receive tasks (with its capabilities), executes them, and reports progress
+     and results.
 4. **Shared contract.** Mind, drones, and human operators all speak gRPC to the
    mind, using a single protobuf contract, versioned under `proto/holism/v1`.
 5. **The mind is the only well-known endpoint.** Drones and human operators
@@ -44,16 +48,16 @@ via mTLS is in scope — see §6.3), multi-tenancy, and UI.
 ```
                  ┌────────────────────────────────────────┐
                  │       Mind (single instance)           │
-                 │  Planner ──► Scheduler ──► TaskStore   │
+                 │  Planner ──► Scheduler ──► TaskStore*  │
                  │       ▲           │           │        │
-                 │       └──── EventBus ◄────────┘        │
+                 │       └──── EventBus* ◄───────┘        │
                  │  gRPC API (mTLS) — the only endpoint   │
                  └───────────┬───────────────┬────────────┘
              bidi stream     │               │  plain RPCs
         ┌────────────────────┘               └───────────┐
-        │  (Connect: register, task submit/ack,        │ (SubmitTask, GetTask,
-        │   progress, result, heartbeat)               │  ListTasks, CancelTask,
-        ▼                                              ▼  SubscribeEvents)
+        │  (Connect: register, task submit/ack,        │ (projects, tasks,
+        │   progress, result, heartbeat)               │  events)
+        ▼                                              ▼
    ┌─────────┐   ┌─────────┐   ┌─────────┐        ┌──────────┐
    │ Drone 1 │   │ Drone 2 │   │ Drone N │  …     │ Operator │
    │ (agent) │   │ (agent) │   │ (agent) │        │ (human)  │
@@ -63,18 +67,20 @@ via mTLS is in scope — see §6.3), multi-tenancy, and UI.
    ┌────────────────────────────────────────┐
    │  Knowledge repository: Linear, Notion… │
    └────────────────────────────────────────┘
+
+   * TaskStore and EventBus are ports: they may be backed by external
+     systems (Linear board, Slack channel) instead of mind-owned services.
 ```
 
 Each box is a container. **Only the mind needs to be network-reachable.**
 Drones and the human operator dial out to the mind's gRPC API over mTLS (see
 §6.3); drones never accept inbound connections.
 
-The mind is a **single instance by design**. All coordination state — the task
-store and the drone registry — lives in the mind, so running several minds
-would require externalizing that state. High availability of the mind is
-explicitly out of scope; if the mind dies, tasks in flight are lost until an
-operator restarts it (the durable `TaskStore` port keeps `queued`/`succeeded`
-history safe across restarts). Drones are homogeneous and stateless.
+The mind is a **single instance by design**. All coordination state — the
+in-memory view of the task store and the drone registry — lives in the mind, so
+running several minds would require externalizing that state. High availability
+of the mind is explicitly out of scope; if the mind dies, tasks in flight are
+lost until an operator restarts it. Drones are homogeneous and stateless.
 
 ## 3. Ports (replaceable abstractions)
 
@@ -84,11 +90,23 @@ is a config change, not a code change.
 
 | Port | Interface (sketch) | Reference adapters |
 |---|---|---|
-| `TaskStore` | `Create(ctx, Task) (Task, error)`, `Get(ctx, id)`, `Update(ctx, Task)`, `List(ctx, Filter)` | in-memory (dev), PostgreSQL |
-| `EventBus` | `Publish(ctx, Event)`, `Subscribe(ctx, Filter) (<-chan Event, error)` | in-memory, NATS |
-| `Planner` (mind) | `Plan(ctx, Goal) ([]TaskSpec, error)` | rule-based, LLM-based |
-| `Executor` (drone) | `Execute(ctx, Task) (Progress, error)` | tool-calling agent, scripted |
+| `TaskStore` | `CreateProject(ctx, Project)`, `GetProject(ctx, id)`, `ListProjects(ctx)`, `Create(ctx, Task)`, `Get(ctx, id)`, `Update(ctx, Task)`, `List(ctx, Filter)` | in-memory (dev), PostgreSQL, **Linear (tasks as tickets on a board, projects as boards)** |
+| `EventBus` | `Publish(ctx, Event)`, `Subscribe(ctx, Filter) (<-chan Event, error)` | in-memory, NATS, **Slack connector (each event becomes a message on a channel)** |
+| `Planner` (mind) | `Plan(ctx, Project, Goal) ([]TaskSpec, error)` | rule-based, LLM-based |
+| `Executor` (drone) | `Execute(ctx, Task) (stream Progress, error)` | tool-calling agent, scripted |
 | `Clock` / `IDGen` | trivial ports to keep tests deterministic | real, fake |
+
+Two delegation notes:
+
+- **`TaskStore` may live outside the mind.** The mind only talks to the port.
+  With the Linear adapter, tasks are tickets on a board and projects are boards;
+  the mind's scheduler still owns assignment state in memory, while durable
+  task state lives in Linear. A PostgreSQL adapter keeps everything in a
+  Holism-owned database. Both are interchangeable by configuration.
+- **`EventBus` may be a notification pipeline.** With the Slack connector
+  adapter, publishing an event means posting a message to a channel. Events
+  carry project/task ids and a human-readable summary so external adapters can
+  render them without knowing Holism internals.
 
 There is deliberately **no knowledge port**: knowledge harnesses are wired
 straight into the planner (mind) and the executor (drone) at the composition
@@ -99,13 +117,27 @@ Wiring rule: **core packages depend only on ports, never on adapters.** Adapters
 import ports; the composition root (`cmd/mind`, `cmd/drone`) picks concrete
 implementations from environment configuration.
 
+### 3.1 Projects
+
+A **project** groups tasks into something with context:
+
+- `id`, `name`
+- `goal` — why the project exists; this is what the planner decomposes
+- `context` — free-form context for agents (links, docs, constraints, repo
+  names), surfaced to drones inside every task of the project
+- `labels` — for filtering and for scheduler matching hints
+
+Tasks always belong to a project (`Task.project_id`). Operators create
+projects and submit goals/tasks within them; drones see the project context
+when executing. Projects are stored through the `TaskStore` port like tasks.
+
 ## 4. Shared contract (protobuf)
 
 One contract, one module, versioned:
 
 ```
 proto/holism/v1/
-├── common.proto     # Task, TaskSpec, TaskResult, TaskStatus, Artifact (keep minimal)
+├── common.proto     # Project, Task, TaskSpec, TaskResult, TaskStatus, Ack, Artifact (keep minimal)
 ├── events.proto     # Event envelope for SubscribeEvents
 └── mind.proto       # MindService — the swarm's single gRPC API
 ```
@@ -120,17 +152,23 @@ the mind and dialed over **mTLS** (see §6.3).
 ```proto
 service MindService {
   // --- drone channel: one durable bidirectional stream per drone ---
-  // The drone opens it, registers, and declares itself ready to receive
-  // tasks. The mind submits tasks and receives acks, progress, and results
-  // on the same stream. See §4.2 for the message flow.
+  // The drone opens it, registers (with its capabilities), and declares itself
+  // ready to receive tasks. The mind submits tasks and receives acks, progress,
+  // and results on the same stream. See §4.2 for the message flow.
   rpc Connect(stream DroneMessage) returns (stream MindMessage);
 
-  // --- operator / upstream-facing RPCs ---
-  rpc SubmitTask(SubmitTaskRequest) returns (Task);   // submit a goal or a task
+  // --- projects ---
+  rpc CreateProject(CreateProjectRequest) returns (Project);
+  rpc GetProject(GetProjectRequest) returns (Project);
+  rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
+
+  // --- tasks (scoped to a project) ---
+  rpc SubmitTask(SubmitTaskRequest) returns (Task);   // submit a goal or a task into a project
   rpc GetTask(GetTaskRequest) returns (Task);
-  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);  // filter by project, status, …
   rpc CancelTask(CancelTaskRequest) returns (Task);
-  // Server-streaming event feed for observability and reactive UIs.
+
+  // --- observability ---
   rpc SubscribeEvents(SubscribeEventsRequest) returns (stream Event);
 }
 ```
@@ -138,31 +176,69 @@ service MindService {
 ### 4.2 The drone channel (`Connect`)
 
 One long-lived **bidirectional stream** per drone. All drone↔mind traffic —
-registration, task submission, ack, progress, result, heartbeats — flows over
+registration, task submission, acks, progress, results, heartbeats — flows over
 this single connection, so a drone only ever opens one outbound connection.
 
 Message envelopes (oneof payloads, so the contract can grow without breaking
-changes):
+changes). Every `DroneMessage` carries a client-generated `id` so the mind can
+acknowledge status updates (§4.2.1):
 
 ```proto
-message DroneMessage {          // drone → mind
+message DroneMessage {            // drone → mind
+  string id = 1;                  // client-generated, referenced by mind Acks
   oneof payload {
-    Register      register = 1; // drone_id, labels, capabilities (first message)
-    Ack           ack = 2;      // task_id, ACCEPTED | REJECTED
-    Progress      progress = 3;// task_id, status, message, percent
-    Result        result = 4;  // task_id, TaskResult (terminal)
-    Heartbeat     heartbeat = 5;// keepalive + current load
-    Bye           bye = 6;      // graceful unregister before closing
+    Register      register = 2;   // first message on the stream
+    TaskAck       task_ack = 3;   // acks a Task submitted by the mind
+    Progress      progress = 4;   // "working on it" / "done"
+    Result        result = 5;     // terminal payload for a task
+    Heartbeat     heartbeat = 6;  // keepalive + current load
+    Bye           bye = 7;       // graceful unregister before closing
   }
 }
 
-message MindMessage {           // mind → drone
+message MindMessage {             // mind → drone
+  string id = 1;
   oneof payload {
-    Task          task = 1;     // a submitted task to execute
-    Cancel        cancel = 2;   // task_id — stop and report
-    Drain         drain = 3;    // finish in-flight work, then close
-    Pong          pong = 4;     // heartbeat reply
+    Task          task = 2;       // a submitted task to execute
+    Cancel        cancel = 3;     // task_id — stop and report
+    Drain         drain = 4;      // finish in-flight work, then close
+    Pong          pong = 5;       // heartbeat reply
+    Ack           ack = 6;        // acks a Progress/Result, by DroneMessage.id
   }
+}
+```
+
+Payload messages (in `common.proto`):
+
+```proto
+message Register {
+  string drone_id = 1;
+  repeated string labels = 2;        // free-form, e.g. "gpu", "region:eu"
+  repeated string capabilities = 3;  // agent skills, e.g. "tool:kubectl",
+                                     // "vcs:git-push", "vcs:sign-commits"
+}
+
+message TaskAck {                 // drone → mind, acks a submitted Task
+  string task_id = 1;
+  bool accepted = 2;              // false ⇒ REJECTED (e.g. at capacity)
+  string reason = 3;              // rejection detail
+}
+
+message Progress {
+  string task_id = 1;
+  enum Status { WORKING = 0; DONE = 1; }  // deliberately minimal
+  Status status = 2;
+  string note = 3;                // optional human-readable detail
+}
+
+message Result {
+  string task_id = 1;
+  string output = 2;              // summary, artifacts, links
+  string error = 3;               // non-empty ⇒ mind will typically mark FAILED
+}
+
+message Ack {                     // mind → drone, acks a DroneMessage by id
+  string ref = 1;                 // DroneMessage.id being acknowledged
 }
 ```
 
@@ -171,40 +247,75 @@ Connection flow:
 ```
 Drone                          Mind
   │ ── Connect() (mTLS) ───────►│
-  │ ── Register{id, labels} ──►│   drone enters the registry as READY
-  │ ◄── Pong / queued backlog ──│   (tasks queued while offline are sent)
+  │ ── Register{id, labels,      │   drone enters the registry as READY
+  │    capabilities} ──────────► │
+  │ ◄── Pong ───────────────────│
   │                             │
-  │ ◄────── Task{task_id} ─────│   scheduler picks this READY drone
-  │ ── Ack{task_id, ACCEPTED} ─►│   task marked ASSIGNED on ack
-  │ ── Progress{...} ──────────►│   task RUNNING; progress recorded
-  │ ── Progress{...} ──────────►│
-  │ ── Result{task_id, ...} ───►│   task SUCCEEDED / FAILED
+  │ ◄────── Task{task_id} ─────│   scheduler: labels + required capabilities match
+  │ ── TaskAck{task_id,         │   task marked ASSIGNED — only now (§4.2.1)
+  │    accepted=true} ─────────►│
+  │ ── Progress{WORKING} ──────►│   task RUNNING
+  │ ◄────── Ack{ref} ──────────│
+  │ ── Progress{WORKING} ──────►│   retried until acked (§4.2.2)
+  │ ── Progress{DONE} ─────────►│
+  │ ── Result{task_id, …} ─────►│   mind examines the result and sets
+  │ ◄────── Ack{ref} ──────────│   SUCCEEDED / FAILED (§4.2.3)
   │                             │
   │ ◄────── Drain ─────────────│   graceful shutdown: finish, then close
   │ ── Bye ────────────────────►│
 ```
 
-Semantics:
+#### 4.2.1 Exactly-once assignment
 
-- **Registration**: the first message on the stream must be `Register`; the
-  mind adds the drone to its in-memory registry as able to receive tasks.
-  Reconnecting with the same `drone_id` replaces the previous stream.
-- **Task submission and ack**: the mind sends `Task`; the drone replies `Ack`
-  with ACCEPTED (it will execute) or REJECTED (e.g. at capacity). The ack
-  marks the task as **assigned**; REJECTED causes the mind to requeue and try
-  another ready drone.
-- **Progress**: the drone sends zero or more `Progress` messages; the mind
-  records them against the task and republishes them on the `EventBus`.
-- **Result**: `Result` is terminal for the task (succeeded or failed).
-- **Heartbeats**: application-level keepalives on the same stream renew the
-  drone's lease; the mind also relies on gRPC keepalive/HTTP2 PING at the
-  transport level.
-- **Reconnect**: if the stream breaks, the drone re-dials with backoff and
-  re-registers. Tasks still marked assigned/running for that drone return to
-  `queued` after lease expiry (at-least-once delivery; idempotency is the
-  executor's responsibility — documented, enforced by convention).
+A task is marked **assigned only when the drone's `TaskAck(accepted=true)`
+arrives on the stream**. Until then the task stays `queued` in the store; if no
+ack arrives within a dispatch timeout, the mind requeues it and may submit it to
+a different ready drone. Drones deduplicate by `task_id` (a repeated `Task` for
+a task already in flight is ignored). Net effect: each task is *assigned* to
+exactly one drone at a time, at-least-once *delivery* of the submission, and
+executor-level idempotency remains the drone's responsibility.
 
-### 4.3 Task lifecycle
+#### 4.2.2 Status updates are retried until acked
+
+Progress and Result are **reliable**: the drone keeps each unacked status
+update in a small retry buffer and resends it with backoff until the mind's
+`Ack{ref}` arrives. The mind acks idempotently (acking the same `DroneMessage.id`
+twice is harmless). Task submission acks (`TaskAck`) are *not* retried by the
+drone — the mind owns that timeout and resubmits (§4.2.1).
+
+#### 4.2.3 Minimal progress, mind decides the final status
+
+The drone only reports `WORKING` ("working on it") or `DONE`, plus the terminal
+`Result`. The mind sets `RUNNING` on the first `WORKING`, and when the `Result`
+arrives it **examines the result** (output, error, artifacts) and decides the
+final status — `SUCCEEDED` or `FAILED` — possibly involving the planner for
+re-planning on failure.
+
+#### 4.2.4 Reconnects
+
+If the stream breaks, the drone re-dials with backoff and re-registers with the
+same identity; re-registering with an existing `drone_id` replaces the previous
+stream. Tasks still marked assigned/running for that drone return to `queued`
+after lease expiry (heartbeats renew the lease).
+
+### 4.3 Capabilities (agent skills)
+
+Agents declare their **capabilities** at registration — free-form strings
+describing what the agent can do, e.g.:
+
+- `tool:kubectl` — can run kubectl against a cluster
+- `vcs:git-push` — can push branches / open PRs
+- `vcs:sign-commits` — can sign commits
+- `notify:slack` — can post to Slack
+
+A task's `TaskSpec.required_capabilities` lists the skills it needs. The
+scheduler only submits a task to a READY drone whose declared capabilities are a
+superset of the required ones (in addition to label matching). Capabilities are
+compared as exact strings; namespacing by prefix (`tool:`, `vcs:`, …) is a
+convention, not enforced by the contract. An empty `required_capabilities` means
+any drone may run the task.
+
+### 4.4 Task lifecycle
 
 ```
 queued ──► assigned ──► running ──► succeeded
@@ -216,11 +327,12 @@ queued ──► assigned ──► running ──► succeeded
 ```
 
 - `queued → assigned`: the scheduler picks a READY drone (registered,
-  heartbeated within the lease window, labels match) and sends `Task` on that
-  drone's stream; the drone's `Ack(ACCEPTED)` transitions the task to
-  `assigned`.
-- `assigned → running`: first `Progress` message (or an explicit
-  `Progress{status: RUNNING}`).
+  heartbeated within the lease window, labels match, **capabilities cover the
+  task's required capabilities**) and sends `Task` on that drone's stream. The
+  transition happens **only** on the drone's `TaskAck(accepted=true)`.
+- `assigned → running`: first `Progress{WORKING}`.
+- `running → succeeded | failed`: the `Progress{DONE}` + `Result` pair; the mind
+  examines the result and sets the final status.
 - If the stream drops, tasks assigned/running on it return to `queued` after
   lease expiry.
 - `maxAttempts` and backoff policy live on `TaskSpec`; the mind enforces them.
@@ -229,46 +341,52 @@ queued ──► assigned ──► running ──► succeeded
 
 ### 5.1 Mind (single instance)
 
-- **Planner** (`Planner` port): turns a submitted goal into an ordered set of
-  `TaskSpec`s (initially rule-based; LLM-based planner is a drop-in adapter).
-  The planner itself may use a knowledge harness to ground its plans.
+- **Planner** (`Planner` port): turns a project's goal into an ordered set of
+  `TaskSpec`s (initially rule-based; LLM-based planner is a drop-in adapter),
+  assigning each task the `required_capabilities` it needs. The planner itself
+  may use a knowledge harness to ground its plans.
 - **Scheduler**: watches the `TaskStore` for `queued` tasks and the registry for
-  READY drones; writes `Task` messages onto the chosen drone's stream queue and
-  tracks the pending ack. Owns leases and retries.
-- **TaskStore** (`TaskStore` port): single source of truth for task state.
-  Backed by the in-memory adapter for v1; the port allows a durable adapter
-  (PostgreSQL) later so task history survives mind restarts.
+  READY drones; submits `Task` messages onto the chosen drone's stream and
+  tracks pending acks. Matches on labels **and capabilities**. Owns dispatch
+  timeouts, leases, and retries.
+- **TaskStore** (`TaskStore` port): projects and tasks. May be backed by an
+  external system (Linear) — the mind never assumes it owns the storage.
 - **Drone registry**: in-memory, keyed by `drone_id`, holding the live stream
-  (or its send queue) and readiness/lease state. Built from `Register` and
-  renewed by `Heartbeat`; entries expire after a missed-heartbeat timeout.
-  Single-instance by design — the registry is why the mind must not be
-  replicated.
+  (or its send queue), labels, capabilities, and readiness/lease state. Built
+  from `Register` and renewed by `Heartbeat`; entries expire after a
+  missed-heartbeat timeout. Single-instance by design — the registry is why the
+  mind must not be replicated.
 - **EventBus** (`EventBus` port): publishes lifecycle events; backs
-  `SubscribeEvents` and future reactive behaviors.
+  `SubscribeEvents` and may deliver them to external systems (e.g. a Slack
+  channel).
 - **gRPC server**: serves `MindService` over mTLS — the only listener in the
   swarm. Also exposes `/healthz` + `/readyz` on the same mTLS listener.
 
 ### 5.2 Drone
 
 - **Mind client**: dials the mind, opens the `Connect` bidi stream, sends
-  `Register` (id, labels, capabilities), then heartbeats. Reconnects with
+  `Register` (id, labels, **capabilities**), then heartbeats. Reconnects with
   backoff on stream failure and re-registers with the same identity.
 - **Inbound loop**: reads `MindMessage`s from the stream — `Task` (validate
-  capacity, reply `Ack`), `Cancel`, `Drain` (finish in-flight work, send `Bye`,
-  exit).
+  capacity, reply `TaskAck`; deduplicate by `task_id`), `Cancel`, `Drain`
+  (finish in-flight work, send `Bye`, exit).
 - **Executor** (`Executor` port): the actual "do the work" unit. Default
   adapter: a tool-calling agent whose tools include the injected knowledge
-  harnesses.
-- **Reporting**: sends `Progress` and the terminal `Result` on the same stream.
+  harnesses and whatever the declared capabilities imply (e.g. a `kubectl` tool
+  for drones advertising `tool:kubectl`).
+- **Reporting**: sends `Progress{WORKING|DONE}` and the terminal `Result` on the
+  same stream, retrying each until the mind acks it.
 
 Drones are stateless and disposable: no local persistence beyond an in-flight
-task, no inbound listener; restart = reconnect and re-register.
+task and the unacked-status retry buffer; no inbound listener; restart =
+reconnect and re-register.
 
 ## 6. Deployment and portability
 
 - **One process per container.** Images: `holism/mind`, `holism/drone`.
 - **Configuration is 100% environment variables** (12-factor): the mind's
-  listen address, adapter selection, store DSNs, and paths to TLS material,
+  listen address, adapter selection (including which TaskStore/EventBus
+  backends), store DSNs or connector endpoints, and paths to TLS material,
   with credentials via env-from-secret.
 - **Runtime-agnostic.** Holism does not assume any orchestrator. The only
   networking requirement is that **the mind is reachable from everywhere** —
@@ -286,8 +404,7 @@ certificates issued by a Holism-internal PKI:
 - One **root CA** per swarm deployment (long-lived, offline key recommended).
 - The mind holds a **server certificate**; every drone (and operator client)
   holds a **client certificate** identifying it (`drone:<id>`, `operator:<id>`)
-  in the SAN/CN. There is no mind→drone TLS: drones accept no inbound
-  connections, so no drone server certificates are needed.
+  in the SAN/CN, valid for about **one month** and renewed via the CLI.
 - Certificates are mounted into containers as files (or injected by the
   runtime's secret mechanism) and referenced by path via env config.
 
@@ -297,17 +414,17 @@ A small CLI, shipped as `holism/cli` (single static binary), bootstraps and
 maintains the PKI:
 
 ```
-holism init                  # generate root CA (key + cert) into ./pki/
-holism cert issue mind       # issue the mind's server certificate
-holism cert issue drone <id> # issue a drone's client certificate
+holism init                      # generate root CA (key + cert) into ./pki/
+holism cert issue mind           # issue the mind's server certificate
+holism cert issue drone <id>     # issue a drone's client certificate
 holism cert issue operator <id>  # issue an operator's client certificate
-holism cert renew <name>     # re-issue before expiry
-holism cert revoke <name>    # revoke (CRL / short-lived certs)
-holism cert list             # show issued certs and expiry
+holism cert renew <name>         # re-issue before expiry (~1 month lifetime)
+holism cert revoke <name>        # revoke (CRL / short-lived certs)
+holism cert list                 # show issued certs and expiry
 ```
 
-Design choices: short-lived leaf certificates (e.g. 24–72 h) with renewal, so
-revocation is rarely needed; the CA key never leaves the machine running
+Design choices: leaf certificates live for about one month and are renewed with
+`holism cert renew` before expiry; the CA key never leaves the machine running
 `holism init`; the CLI only ever reads/writes the `./pki/` directory, which the
 operator distributes to containers out of band. Generated material is git-ignored.
 
@@ -335,9 +452,9 @@ holism/
 │   ├── cmd/mind/             # composition root
 │   └── internal/
 │       ├── planner/          # port + adapters
-│       ├── scheduler/
-│       ├── taskstore/        # port + adapters (memory, postgres)
-│       ├── eventbus/         # port + adapters (memory, nats)
+│       ├── scheduler/        # label + capability matching, dispatch, leases
+│       ├── taskstore/        # port + adapters (memory, postgres, linear)
+│       ├── eventbus/         # port + adapters (memory, nats, slack)
 │       ├── registry/         # drone registry (live streams, leases)
 │       └── server/           # MindService gRPC server (incl. Connect)
 ├── drone/
@@ -356,33 +473,42 @@ holism/
 Go workspace (`go.work`) with one module per component (`mind`, `drone`,
 `cli`, `api`) so components can evolve independently while sharing the contract.
 
-## 8. Open questions for review
+## 8. Resolved design decisions
 
-1. **Delivery semantics**: at-least-once with executor idempotency (chosen) vs
-   exactly-once via transactional outbox — confirm at-least-once is acceptable.
-2. **Goal decomposition**: is `Planner.Plan(Goal) → []TaskSpec` the right first
-   cut, or should v1 accept only pre-decomposed tasks and add goals later?
-3. **Progress granularity**: `Progress` as discrete messages on the stream
-   (chosen) vs finer-grained token-level events.
-4. **Backpressure**: if a drone's send queue grows unboundedly (slow mind),
-   should the mind drop progress messages or apply flow control? (v1: drop
-   progress, never drop ack/result.)
-5. **Certificate lifetime**: short-lived leaves with renewal (chosen, 24–72 h)
-   vs longer-lived certs with a CRL.
-6. **Operator authentication**: v1 uses the same client-cert mTLS as drones
-   (chosen); a token-based path for human operators may come later.
+1. **Assignment is exactly-once.** The drone must acknowledge (`TaskAck`) for the
+   mind to mark a task as assigned. No ack within the dispatch timeout ⇒ the
+   task stays queued and may be submitted to another drone; drones dedupe by
+   `task_id`.
+2. **The planner splits goals into tasks.** `Planner.Plan(ctx, Project, Goal) →
+   []TaskSpec` is the right first cut.
+3. **Progress is minimal.** The drone only reports "working on it" (`WORKING`)
+   or "done" (`DONE`); the mind examines the result and decides the final task
+   status.
+4. **Status updates are reliable.** The drone retries progress/result messages
+   until the mind acks them (`Ack{ref}`).
+5. **Certificate lifetime is ~1 month**, renewed via `holism cert renew`.
+6. **Operators authenticate with client certificates**, same mTLS path as
+   drones.
+
+Open questions that remain:
+
+1. **Capability taxonomy**: free-form strings with a prefix convention (chosen)
+   vs a registry of well-known capabilities enforced by the contract.
+2. **Project context schema**: free-form string (chosen) vs structured fields
+   (repo, docs, constraints).
 
 ## 9. Roadmap
 
-1. **Phase 1 — skeleton**: buf module + contract (`MindService` with `Connect`),
-   the `holism` CLI (`init` + `cert issue`), in-memory adapters for every port,
-   single mind + N drones over docker-compose with mTLS, happy-path task
-   dispatch over the drone stream.
-2. **Phase 2 — real adapters**: Postgres `TaskStore`, NATS `EventBus`,
+1. **Phase 1 — skeleton**: buf module + contract (`MindService` with `Connect`,
+   projects, capabilities), the `holism` CLI (`init` + `cert issue`), in-memory
+   adapters for every port, single mind + N drones over docker-compose with
+   mTLS, happy-path task dispatch over the drone stream.
+2. **Phase 2 — external adapters**: Linear-backed `TaskStore` (tasks as
+   tickets), Slack-backed `EventBus`, PostgreSQL `TaskStore`, NATS `EventBus`,
    LLM-planner adapter, cert renewal automation, executor idempotency helpers.
 3. **Phase 3 — hardening**: drain/graceful-shutdown semantics, certificate
-   identity-based coarse authorization, richer observability, durable store
-   failover runbook for the single-instance mind.
+   identity-based coarse authorization, richer observability, failover runbook
+   for the single-instance mind.
 
 ## 10. Glossary
 
@@ -390,6 +516,11 @@ Go workspace (`go.work`) with one module per component (`mind`, `drone`,
   instance by design; the swarm's only network endpoint.
 - **Drone**: stateless worker; connects to the mind over a durable bidi stream
   and executes submitted tasks.
+- **Project**: a group of tasks with shared context (goal, description,
+  labels); the unit the planner decomposes.
+- **Capability**: an agent skill declared at registration (e.g. `tool:kubectl`,
+  `vcs:git-push`); tasks declare required capabilities and the scheduler matches
+  them.
 - **Port**: a small Go interface hiding an external dependency.
 - **Adapter**: a concrete implementation of a port.
 - **Contract**: the versioned protobuf module shared by all components.
