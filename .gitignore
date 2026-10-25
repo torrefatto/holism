@@ -1,0 +1,5 @@
+/bin/
+/pki/
+*.test
+*.out
+coverage.txt
