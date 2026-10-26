@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+      - name: Lint
+        run: |
+          if find proto -name '*.proto' -print -quit | grep -q .; then
+            buf lint
+          else
+            echo "no .proto files yet, skipping buf lint"
+          fi
+      - name: Breaking
+        if: github.event_name == 'pull_request' && hashFiles('proto/**/*.proto') != ''
+        uses: bufbuild/buf-breaking-action@v1
+        with:
+          against: ${{ github.event.repository.default_branch }}
+
+  go:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [api, cli, drone, mind]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - name: Build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+      - name: Test
+        working-directory: ${{ matrix.module }}
+        run: go test ./...
+      - name: Vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
