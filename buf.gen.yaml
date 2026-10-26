@@ -11,6 +11,11 @@ plugins:
   - remote: buf.build/grpc/go
     out: api
     opt: paths=source_relative
-  - remote: buf.build/bufbuild/validate-go
+  - local: protoc-gen-validate
     out: api
-    opt: paths=source_relative
+    opt: paths=source_relative,lang=go
+  # The vendored validate.proto (proto/vendor/validate) is generated separately:
+  #   buf generate --template buf.gen.validate.yaml --path proto/vendor
+  # Its generated Go code is rewritten to the canonical
+  # github.com/envoyproxy/protoc-gen-validate/validate import path, so the
+  # module does not vendor the generated package itself.

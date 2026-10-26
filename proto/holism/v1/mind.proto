@@ -1,0 +1,155 @@
+syntax = "proto3";
+
+package holism.v1;
+
+import "vendor/validate/validate.proto";
+import "holism/v1/common.proto";
+import "holism/v1/events.proto";
+
+option go_package = "github.com/torrefatto/holism/api/holism/v1;holismv1";
+
+// MindService is the swarm's single gRPC API, served by the mind (the only
+// network endpoint). Drones and human operators dial out to it over mTLS.
+service MindService {
+  // The drone channel: one durable bidirectional stream per drone.
+  // The drone opens it, registers with its capabilities, and declares itself
+  // ready to receive tasks. The mind submits tasks and receives acks,
+  // progress, and results on the same stream.
+  rpc Connect(stream DroneMessage) returns (stream MindMessage);
+
+  // Projects.
+  rpc CreateProject(CreateProjectRequest) returns (Project);
+  rpc GetProject(GetProjectRequest) returns (Project);
+  rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
+
+  // Tasks. Every task lives inside a project.
+  rpc SubmitTask(SubmitTaskRequest) returns (Task);
+  rpc GetTask(GetTaskRequest) returns (Task);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc CancelTask(CancelTaskRequest) returns (Task);
+
+  // Server-streaming event feed for observability and reactive UIs.
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream Event);
+}
+
+// DroneMessage is one message from a drone to the mind on the Connect stream.
+// id is client-generated; the mind references it in Ack to acknowledge
+// status updates.
+message DroneMessage {
+  string id = 1;
+  oneof payload {
+    Register register = 2;
+    TaskAck task_ack = 3;
+    Progress progress = 4;
+    Result result = 5;
+    Heartbeat heartbeat = 6;
+    Bye bye = 7;
+  }
+}
+
+// MindMessage is one message from the mind to a drone on the Connect stream.
+message MindMessage {
+  string id = 1;
+  oneof payload {
+    Task task = 2;
+    Cancel cancel = 3;
+    Drain drain = 4;
+    Pong pong = 5;
+    Ack ack = 6;
+  }
+}
+
+// Register is the first message a drone sends on the stream. It registers the
+// drone and declares it able to receive tasks.
+message Register {
+  string drone_id = 1 [
+    (validate.rules).string = {min_len: 1}
+  ];
+  repeated string labels = 2;
+  repeated Capability capabilities = 3;
+}
+
+message Heartbeat {
+  string drone_id = 1;
+  // Current number of in-flight tasks; used for load-aware scheduling.
+  int32 load = 2;
+}
+
+// Bye is the drone's graceful unregister before closing the stream.
+message Bye {
+  string drone_id = 1;
+}
+
+message Pong {}
+
+// Cancel asks the drone to stop working on a task and report.
+message Cancel {
+  string task_id = 1;
+}
+
+// Drain asks the drone to finish its in-flight task, then close cleanly.
+message Drain {}
+
+message CreateProjectRequest {
+  string name = 1 [
+    (validate.rules).string = {min_len: 1}
+  ];
+  string goal = 2;
+  string description = 3;
+  repeated string labels = 4;
+}
+
+message GetProjectRequest {
+  string id = 1 [
+    (validate.rules).string = {min_len: 1}
+  ];
+}
+
+message ListProjectsRequest {
+  string label = 1;
+}
+
+message ListProjectsResponse {
+  repeated Project projects = 1;
+}
+
+message SubmitTaskRequest {
+  // Required: a task can never be submitted outside a project.
+  string project_id = 1 [
+    (validate.rules).string = {min_len: 1}
+  ];
+  // Either a ready-made spec or a free-form goal for the planner to decompose.
+  oneof payload {
+    TaskSpec spec = 2;
+    string goal = 3;
+  }
+}
+
+message GetTaskRequest {
+  string id = 1 [
+    (validate.rules).string = {min_len: 1}
+  ];
+}
+
+message ListTasksRequest {
+  // Required: tasks are always listed within a project.
+  string project_id = 1 [
+    (validate.rules).string = {min_len: 1}
+  ];
+  TaskStatus status = 2;
+}
+
+message ListTasksResponse {
+  repeated Task tasks = 1;
+}
+
+message CancelTaskRequest {
+  string id = 1 [
+    (validate.rules).string = {min_len: 1}
+  ];
+}
+
+message SubscribeEventsRequest {
+  // Optional: only receive events for this project.
+  string project_id = 1;
+}

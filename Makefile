@@ -15,6 +15,13 @@ PROTO_FILES := $(shell find proto -name '*.proto' 2>/dev/null)
 generate:
 ifneq ($(PROTO_FILES),)
 	$(BUF) generate
+	@# protoc-gen-validate writes the vendored validate.proto's Go code under
+	@# api/vendor; the canonical import is github.com/envoyproxy/protoc-gen-validate,
+	@# so we keep only holism/v1 and drop the vendored copy.
+	@rm -rf api/vendor
+	@sed -i.bak 's|github.com/torrefatto/holism/api/vendor/validate|github.com/envoyproxy/protoc-gen-validate/validate|' api/holism/v1/*.pb.go
+	@rm -f api/holism/v1/*.bak
+	(cd api && go mod tidy)
 else
 	@echo "no .proto files yet, skipping generate"
 endif

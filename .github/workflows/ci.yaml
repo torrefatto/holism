@@ -19,10 +19,22 @@ jobs:
             echo "no .proto files yet, skipping buf lint"
           fi
       - name: Breaking
-        if: github.event_name == 'pull_request' && hashFiles('proto/**/*.proto') != ''
+        id: breaking
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
         uses: bufbuild/buf-breaking-action@v1
         with:
           against: ${{ github.event.repository.default_branch }}
+      - name: Check breaking result
+        if: steps.breaking.outcome == 'failure'
+        run: |
+          # The base branch (main) has no .proto files yet, so buf breaking
+          # fails with "had no .proto files" — not a real breaking change.
+          if git ls-tree -r --name-only origin/${{ github.event.repository.default_branch }} -- proto | grep -q '\.proto$'; then
+            echo "::error::buf breaking failed"
+            exit 1
+          fi
+          echo "base branch has no .proto files; breaking check not applicable"
 
   go:
     runs-on: ubuntu-latest
