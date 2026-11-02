@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package holism.v1;
+
+import "vendor/validate/validate.proto";
+
+option go_package = "github.com/torrefatto/holism/api/holism/v1;holismv1";
+
+// A project groups tasks into something with context. Every task belongs to
+// exactly one project; the planner decomposes a project's goal into tasks.
+message Project {
+  string id = 1;
+  string name = 2;
+  // Why the project exists; this is what the planner decomposes into tasks.
+  string goal = 3;
+  // Free-form context for agents (links, docs, constraints, repo names),
+  // surfaced to drones inside every task of the project.
+  string description = 4;
+  repeated string labels = 5;
+}
+
+// A capability is an agent skill declared by a drone at registration.
+// The name is the machine-comparable handle (matched against
+// TaskSpec.required_capabilities); the description is human/agent-facing.
+message Capability {
+  string name = 1 [
+    (validate.rules).string = {min_len: 1}
+  ];
+  string description = 2;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_QUEUED = 1;
+  TASK_STATUS_ASSIGNED = 2;
+  TASK_STATUS_RUNNING = 3;
+  TASK_STATUS_SUCCEEDED = 4;
+  TASK_STATUS_FAILED = 5;
+  TASK_STATUS_CANCELLED = 6;
+}
+
+// TaskSpec describes work to be done. A submission carrying a goal instead of
+// a spec is decomposed by the planner into one or more tasks.
+message TaskSpec {
+  string title = 1;
+  string description = 2;
+  // Capability names a drone must declare to receive this task
+  // (e.g. "tool:kubectl", "vcs:git-push"). Empty means any drone.
+  repeated string required_capabilities = 3;
+  int32 max_attempts = 4;
+  // Backoff between retries, in seconds.
+  int64 retry_backoff_seconds = 5;
+}
+
+// A task is a unit of work. It always belongs to a project.
+message Task {
+  string id = 1;
+  // Required: a task can never exist outside a project.
+  string project_id = 2 [
+    (validate.rules).string = {min_len: 1}
+  ];
+  TaskSpec spec = 3;
+  TaskStatus status = 4;
+  // The drone currently assigned, empty while queued.
+  string assigned_drone_id = 5;
+  int32 attempts = 6;
+  Result result = 7;
+  int64 created_at_unix = 8;
+  int64 updated_at_unix = 9;
+}
+
+// An artifact produced by a task (link, file reference, PR URL, …).
+message Artifact {
+  string name = 1;
+  string uri = 2;
+  string description = 3;
+}
+
+// The terminal payload a drone reports for a task. The mind examines it and
+// decides the final task status (succeeded/failed).
+message Result {
+  string task_id = 1;
+  // Summary of what was done.
+  string output = 2;
+  repeated Artifact artifacts = 3;
+  // Non-empty means the mind will typically mark the task FAILED.
+  string error = 4;
+}
+
+// Minimal progress report: the drone only says "working on it" or "done".
+message Progress {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_WORKING = 1;
+    STATUS_DONE = 2;
+  }
+  string task_id = 1;
+  Status status = 2;
+  // Optional human-readable detail.
+  string note = 3;
+}
+
+// Drone -> mind acknowledgement of a submitted task. accepted=true is the only
+// event that marks a task as assigned (exactly-once assignment).
+message TaskAck {
+  string task_id = 1;
+  bool accepted = 2;
+  // Rejection detail (e.g. at capacity).
+  string reason = 3;
+}
+
+// Mind -> drone acknowledgement of a status update, by DroneMessage.id.
+message Ack {
+  // The DroneMessage.id being acknowledged.
+  string ref = 1;
+}

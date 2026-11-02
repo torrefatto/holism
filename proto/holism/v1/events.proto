@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package holism.v1;
+
+option go_package = "github.com/torrefatto/holism/api/holism/v1;holismv1";
+
+// Event is the envelope published on the EventBus for every lifecycle
+// transition. It carries a human-readable summary so external EventBus
+// adapters (e.g. a Slack connector) can render it without Holism internals.
+message Event {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_PROJECT_CREATED = 1;
+    TYPE_TASK_QUEUED = 2;
+    TYPE_TASK_ASSIGNED = 3;
+    TYPE_TASK_RUNNING = 4;
+    TYPE_TASK_SUCCEEDED = 5;
+    TYPE_TASK_FAILED = 6;
+    TYPE_TASK_CANCELLED = 7;
+    TYPE_DRONE_REGISTERED = 8;
+    TYPE_DRONE_UNREGISTERED = 9;
+  }
+  string id = 1;
+  Type type = 2;
+  string project_id = 3;
+  string task_id = 4;
+  string drone_id = 5;
+  // Human-readable summary, e.g. "task t-123 assigned to drone d-7".
+  string summary = 6;
+  int64 timestamp_unix = 7;
+}
