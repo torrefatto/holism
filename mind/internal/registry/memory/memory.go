@@ -6,6 +6,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -53,19 +54,10 @@ func copyDrone(d *registry.Drone) *registry.Drone {
 	return &out
 }
 
-func hasString(list []string, want string) bool {
-	for _, s := range list {
-		if s == want {
-			return true
-		}
-	}
-	return false
-}
-
 // hasAll reports whether list contains every want element.
 func hasAll(list, want []string) bool {
 	for _, w := range want {
-		if !hasString(list, w) {
+		if !slices.Contains(list, w) {
 			return false
 		}
 	}

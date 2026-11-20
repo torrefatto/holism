@@ -6,6 +6,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 
@@ -57,19 +58,10 @@ func cloneTask(t *holismv1.Task) *holismv1.Task {
 	return proto.Clone(t).(*holismv1.Task)
 }
 
-func hasLabel(labels []string, label string) bool {
-	for _, l := range labels {
-		if l == label {
-			return true
-		}
-	}
-	return false
-}
-
 // hasAllLabels reports whether labels contains every want label.
 func hasAllLabels(labels, want []string) bool {
 	for _, w := range want {
-		if !hasLabel(labels, w) {
+		if !slices.Contains(labels, w) {
 			return false
 		}
 	}
@@ -111,7 +103,7 @@ func (s *Store) ListProjects(ctx context.Context, filter taskstore.ProjectFilter
 	defer s.mu.RUnlock()
 	var out []*holismv1.Project
 	for _, p := range s.projects {
-		if filter.Label != "" && !hasLabel(p.Labels, filter.Label) {
+		if filter.Label != "" && !slices.Contains(p.Labels, filter.Label) {
 			continue
 		}
 		out = append(out, cloneProject(p))
