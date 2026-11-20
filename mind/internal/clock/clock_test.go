@@ -1,30 +1,23 @@
 package clock
 
 import (
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestRealClock(t *testing.T) {
-	before := time.Now()
 	got := RealClock{}.Now()
-	after := time.Now()
-	if got.Before(before) || got.After(after) {
-		t.Fatalf("Now() = %v, want within [%v, %v]", got, before, after)
-	}
+	assert.WithinDuration(t, time.Now(), got, 5*time.Second)
 }
 
 func TestRealIDGen(t *testing.T) {
 	gen := RealIDGen{}
 	a, b := gen.NewID("task"), gen.NewID("task")
-	if !strings.HasPrefix(a, "task-") || len(strings.TrimPrefix(a, "task-")) != 16 {
-		t.Fatalf("NewID(%q) = %q, want prefix + 16 hex chars", "task", a)
-	}
-	if a == b {
-		t.Fatalf("NewID returned the same id twice: %q", a)
-	}
-	if got := gen.NewID(""); strings.Contains(got, "-") || len(got) != 16 {
-		t.Fatalf("NewID(\"\") = %q, want bare 16 hex chars", got)
-	}
+	assert.Regexp(t, `^task-[0-9a-f]{16}$`, a)
+	assert.NotEqual(t, a, b, "ids must be unique")
+	bare := gen.NewID("")
+	assert.Len(t, bare, 16)
+	assert.NotContains(t, bare, "-")
 }

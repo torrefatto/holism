@@ -2,10 +2,12 @@ package memory
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	holismv1 "github.com/torrefatto/holism/api/holism/v1"
 	"github.com/torrefatto/holism/mind/internal/taskstore"
@@ -36,18 +38,14 @@ func newTestStore() (*Store, *fakeClock, *fakeIDs) {
 func mustCreateProject(t *testing.T, s *Store, p *holismv1.Project) *holismv1.Project {
 	t.Helper()
 	out, err := s.CreateProject(context.Background(), p)
-	if err != nil {
-		t.Fatalf("CreateProject: %v", err)
-	}
+	require.NoError(t, err)
 	return out
 }
 
 func mustCreateTask(t *testing.T, s *Store, task *holismv1.Task) *holismv1.Task {
 	t.Helper()
 	out, err := s.Create(context.Background(), task)
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	require.NoError(t, err)
 	return out
 }
 
@@ -56,48 +54,38 @@ func TestCreateAndGetProject(t *testing.T) {
 	ctx := context.Background()
 
 	p := mustCreateProject(t, s, &holismv1.Project{Name: "web shop", Goal: "sell things", Labels: []string{"gpu"}})
-	if p.Id != "proj-001" {
-		t.Fatalf("assigned id = %q, want proj-001", p.Id)
-	}
+	assert.Equal(t, "proj-001", p.Id, "store should assign an id")
 
 	got, err := s.GetProject(ctx, p.Id)
-	if err != nil {
-		t.Fatalf("GetProject: %v", err)
-	}
-	if got.Name != "web shop" || got.Goal != "sell things" || len(got.Labels) != 1 {
-		t.Fatalf("GetProject = %+v", got)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "web shop", got.Name)
+	assert.Equal(t, "sell things", got.Goal)
+	assert.Equal(t, []string{"gpu"}, got.Labels)
 
 	// The store must not alias the caller's message or its own copy.
 	p.Name = "mutated"
-	again, _ := s.GetProject(ctx, got.Id)
-	if again.Name != "web shop" {
-		t.Fatalf("stored project was mutated through the returned message: %+v", again)
-	}
+	again, err := s.GetProject(ctx, got.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "web shop", again.Name)
 	again.Name = "mutated-again"
-	third, _ := s.GetProject(ctx, got.Id)
-	if third.Name != "web shop" {
-		t.Fatalf("stored project was mutated through a returned message: %+v", third)
-	}
+	third, err := s.GetProject(ctx, got.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "web shop", third.Name)
 }
 
 func TestCreateProjectErrors(t *testing.T) {
 	s, _, _ := newTestStore()
 	ctx := context.Background()
 
-	if _, err := s.CreateProject(ctx, &holismv1.Project{}); !errors.Is(err, taskstore.ErrInvalid) {
-		t.Fatalf("empty name: err = %v, want ErrInvalid", err)
-	}
-	if _, err := s.CreateProject(ctx, nil); !errors.Is(err, taskstore.ErrInvalid) {
-		t.Fatalf("nil project: err = %v, want ErrInvalid", err)
-	}
+	_, err := s.CreateProject(ctx, &holismv1.Project{})
+	assert.ErrorIs(t, err, taskstore.ErrInvalid, "empty name")
+	_, err = s.CreateProject(ctx, nil)
+	assert.ErrorIs(t, err, taskstore.ErrInvalid, "nil project")
 	mustCreateProject(t, s, &holismv1.Project{Id: "p1", Name: "one"})
-	if _, err := s.CreateProject(ctx, &holismv1.Project{Id: "p1", Name: "dup"}); !errors.Is(err, taskstore.ErrAlreadyExists) {
-		t.Fatalf("duplicate id: err = %v, want ErrAlreadyExists", err)
-	}
-	if _, err := s.GetProject(ctx, "nope"); !errors.Is(err, taskstore.ErrNotFound) {
-		t.Fatalf("unknown id: err = %v, want ErrNotFound", err)
-	}
+	_, err = s.CreateProject(ctx, &holismv1.Project{Id: "p1", Name: "dup"})
+	assert.ErrorIs(t, err, taskstore.ErrAlreadyExists, "duplicate id")
+	_, err = s.GetProject(ctx, "nope")
+	assert.ErrorIs(t, err, taskstore.ErrNotFound, "unknown id")
 }
 
 func TestListProjectsFilterByLabel(t *testing.T) {
@@ -108,28 +96,25 @@ func TestListProjectsFilterByLabel(t *testing.T) {
 	mustCreateProject(t, s, &holismv1.Project{Id: "c", Name: "c"})
 
 	all, err := s.ListProjects(ctx, taskstore.ProjectFilter{})
-	if err != nil || len(all) != 3 {
-		t.Fatalf("ListProjects all = %d, %v", len(all), err)
-	}
-	if all[0].Id != "a" || all[1].Id != "b" || all[2].Id != "c" {
-		t.Fatalf("ListProjects not sorted by id: %v %v %v", all[0].Id, all[1].Id, all[2].Id)
-	}
+	require.NoError(t, err)
+	require.Len(t, all, 3)
+	assert.Equal(t, []string{"a", "b", "c"}, []string{all[0].Id, all[1].Id, all[2].Id}, "sorted by id")
+
 	gpu, err := s.ListProjects(ctx, taskstore.ProjectFilter{Label: "gpu"})
-	if err != nil || len(gpu) != 2 || gpu[0].Id != "a" || gpu[1].Id != "b" {
-		t.Fatalf("ListProjects label=gpu = %+v, %v", gpu, err)
-	}
+	require.NoError(t, err)
+	require.Len(t, gpu, 2)
+	assert.Equal(t, "a", gpu[0].Id)
+	assert.Equal(t, "b", gpu[1].Id)
 }
 
 func TestCreateTaskRequiresExistingProject(t *testing.T) {
 	s, _, _ := newTestStore()
 	ctx := context.Background()
 
-	if _, err := s.Create(ctx, &holismv1.Task{Spec: &holismv1.TaskSpec{Title: "x"}}); !errors.Is(err, taskstore.ErrInvalid) {
-		t.Fatalf("empty project_id: err = %v, want ErrInvalid", err)
-	}
-	if _, err := s.Create(ctx, &holismv1.Task{ProjectId: "ghost", Spec: &holismv1.TaskSpec{Title: "x"}}); !errors.Is(err, taskstore.ErrNotFound) {
-		t.Fatalf("unknown project: err = %v, want ErrNotFound", err)
-	}
+	_, err := s.Create(ctx, &holismv1.Task{Spec: &holismv1.TaskSpec{Title: "x"}})
+	assert.ErrorIs(t, err, taskstore.ErrInvalid, "empty project_id")
+	_, err = s.Create(ctx, &holismv1.Task{ProjectId: "ghost", Spec: &holismv1.TaskSpec{Title: "x"}})
+	assert.ErrorIs(t, err, taskstore.ErrNotFound, "unknown project")
 }
 
 func TestCreateTaskDefaultsAndIsolation(t *testing.T) {
@@ -141,32 +126,21 @@ func TestCreateTaskDefaultsAndIsolation(t *testing.T) {
 		ProjectId: p.Id,
 		Spec:      &holismv1.TaskSpec{Title: "do something"},
 	})
-	if tk.Id != "task-001" {
-		t.Fatalf("assigned id = %q, want task-001", tk.Id)
-	}
-	if tk.Status != holismv1.TaskStatus_TASK_STATUS_QUEUED {
-		t.Fatalf("status = %v, want QUEUED", tk.Status)
-	}
+	assert.Equal(t, "task-001", tk.Id, "store should assign an id")
+	assert.Equal(t, holismv1.TaskStatus_TASK_STATUS_QUEUED, tk.Status, "UNSPECIFIED becomes QUEUED")
 	want := clk.Now().Unix()
-	if tk.CreatedAtUnix != want || tk.UpdatedAtUnix != want {
-		t.Fatalf("timestamps = %d/%d, want %d", tk.CreatedAtUnix, tk.UpdatedAtUnix, want)
-	}
+	assert.Equal(t, want, tk.CreatedAtUnix)
+	assert.Equal(t, want, tk.UpdatedAtUnix)
 
 	tk.Spec.Title = "mutated"
 	got, err := s.Get(ctx, tk.Id)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if got.Spec.Title != "do something" {
-		t.Fatalf("stored task mutated through returned message: %+v", got.Spec)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "do something", got.Spec.Title, "stored task must not be mutated through a returned message")
 
-	if _, err := s.Create(ctx, &holismv1.Task{Id: tk.Id, ProjectId: p.Id}); !errors.Is(err, taskstore.ErrAlreadyExists) {
-		t.Fatalf("duplicate id: err = %v, want ErrAlreadyExists", err)
-	}
-	if _, err := s.Get(ctx, "ghost"); !errors.Is(err, taskstore.ErrNotFound) {
-		t.Fatalf("unknown id: err = %v, want ErrNotFound", err)
-	}
+	_, err = s.Create(ctx, &holismv1.Task{Id: tk.Id, ProjectId: p.Id})
+	assert.ErrorIs(t, err, taskstore.ErrAlreadyExists, "duplicate id")
+	_, err = s.Get(ctx, "ghost")
+	assert.ErrorIs(t, err, taskstore.ErrNotFound, "unknown id")
 }
 
 func TestUpdateTask(t *testing.T) {
@@ -183,28 +157,16 @@ func TestUpdateTask(t *testing.T) {
 		Status:    holismv1.TaskStatus_TASK_STATUS_RUNNING,
 		Spec:      &holismv1.TaskSpec{Title: "t"},
 	})
-	if err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-	if updated.Status != holismv1.TaskStatus_TASK_STATUS_RUNNING {
-		t.Fatalf("status = %v, want RUNNING", updated.Status)
-	}
-	if updated.ProjectId != p.Id {
-		t.Fatalf("project_id changed to %q, want immutable %q", updated.ProjectId, p.Id)
-	}
-	if updated.CreatedAtUnix != created {
-		t.Fatalf("created_at = %d, want preserved %d", updated.CreatedAtUnix, created)
-	}
-	if updated.UpdatedAtUnix != created+3600 {
-		t.Fatalf("updated_at = %d, want %d", updated.UpdatedAtUnix, created+3600)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, holismv1.TaskStatus_TASK_STATUS_RUNNING, updated.Status)
+	assert.Equal(t, p.Id, updated.ProjectId, "project_id must be immutable")
+	assert.Equal(t, created, updated.CreatedAtUnix, "created_at must be preserved")
+	assert.Equal(t, created+3600, updated.UpdatedAtUnix, "updated_at must be re-stamped")
 
-	if _, err := s.Update(ctx, &holismv1.Task{Id: "ghost", ProjectId: p.Id}); !errors.Is(err, taskstore.ErrNotFound) {
-		t.Fatalf("unknown id: err = %v, want ErrNotFound", err)
-	}
-	if _, err := s.Update(ctx, &holismv1.Task{ProjectId: p.Id}); !errors.Is(err, taskstore.ErrInvalid) {
-		t.Fatalf("empty id: err = %v, want ErrInvalid", err)
-	}
+	_, err = s.Update(ctx, &holismv1.Task{Id: "ghost", ProjectId: p.Id})
+	assert.ErrorIs(t, err, taskstore.ErrNotFound, "unknown id")
+	_, err = s.Update(ctx, &holismv1.Task{ProjectId: p.Id})
+	assert.ErrorIs(t, err, taskstore.ErrInvalid, "empty id")
 }
 
 func TestListTasksFilter(t *testing.T) {
@@ -217,42 +179,38 @@ func TestListTasksFilter(t *testing.T) {
 	clk.t = clk.t.Add(time.Second)
 	t2 := mustCreateTask(t, s, &holismv1.Task{ProjectId: gpu.Id, Spec: &holismv1.TaskSpec{Title: "t2"}})
 	mustCreateTask(t, s, &holismv1.Task{ProjectId: cpu.Id, Spec: &holismv1.TaskSpec{Title: "other"}})
-	if _, err := s.Update(ctx, &holismv1.Task{Id: t2.Id, ProjectId: gpu.Id, Status: holismv1.TaskStatus_TASK_STATUS_RUNNING}); err != nil {
-		t.Fatalf("Update: %v", err)
-	}
+	_, err := s.Update(ctx, &holismv1.Task{Id: t2.Id, ProjectId: gpu.Id, Status: holismv1.TaskStatus_TASK_STATUS_RUNNING})
+	require.NoError(t, err)
 
 	// project_id is required.
-	if _, err := s.List(ctx, taskstore.Filter{}); !errors.Is(err, taskstore.ErrInvalid) {
-		t.Fatalf("empty project_id: err = %v, want ErrInvalid", err)
-	}
+	_, err = s.List(ctx, taskstore.Filter{})
+	assert.ErrorIs(t, err, taskstore.ErrInvalid, "empty project_id")
 
 	// All tasks of the project, sorted by (created_at, id).
 	all, err := s.List(ctx, taskstore.Filter{ProjectID: gpu.Id})
-	if err != nil || len(all) != 2 || all[0].Id != t1.Id || all[1].Id != t2.Id {
-		t.Fatalf("List all = %+v, %v", all, err)
-	}
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	assert.Equal(t, t1.Id, all[0].Id)
+	assert.Equal(t, t2.Id, all[1].Id)
 
 	// Status filter.
 	running := holismv1.TaskStatus_TASK_STATUS_RUNNING
 	byStatus, err := s.List(ctx, taskstore.Filter{ProjectID: gpu.Id, Status: &running})
-	if err != nil || len(byStatus) != 1 || byStatus[0].Id != t2.Id {
-		t.Fatalf("List by status = %+v, %v", byStatus, err)
-	}
+	require.NoError(t, err)
+	require.Len(t, byStatus, 1)
+	assert.Equal(t, t2.Id, byStatus[0].Id)
 
 	// Label filter: labels match the owning project's labels (all must match).
 	byLabel, err := s.List(ctx, taskstore.Filter{ProjectID: gpu.Id, Labels: []string{"gpu", "region:eu"}})
-	if err != nil || len(byLabel) != 2 {
-		t.Fatalf("List by labels [gpu region:eu] = %+v, %v", byLabel, err)
-	}
+	require.NoError(t, err)
+	assert.Len(t, byLabel, 2)
 	noMatch, err := s.List(ctx, taskstore.Filter{ProjectID: gpu.Id, Labels: []string{"gpu", "missing"}})
-	if err != nil || len(noMatch) != 0 {
-		t.Fatalf("List by labels [gpu missing] = %+v, %v", noMatch, err)
-	}
+	require.NoError(t, err)
+	assert.Empty(t, noMatch)
 	// Same filter on the unlabeled project matches nothing.
 	cpuTasks, err := s.List(ctx, taskstore.Filter{ProjectID: cpu.Id, Labels: []string{"gpu"}})
-	if err != nil || len(cpuTasks) != 0 {
-		t.Fatalf("List cpu with label gpu = %+v, %v", cpuTasks, err)
-	}
+	require.NoError(t, err)
+	assert.Empty(t, cpuTasks)
 }
 
 func TestConcurrentUse(t *testing.T) {
@@ -265,16 +223,13 @@ func TestConcurrentUse(t *testing.T) {
 			defer func() { done <- struct{}{} }()
 			for j := 0; j < 50; j++ {
 				tk, err := s.Create(ctx, &holismv1.Task{ProjectId: p.Id, Spec: &holismv1.TaskSpec{Title: fmt.Sprintf("t%d-%d", i, j)}})
-				if err != nil {
-					t.Errorf("Create: %v", err)
+				if !assert.NoError(t, err) {
 					return
 				}
-				if _, err := s.Update(ctx, &holismv1.Task{Id: tk.Id, ProjectId: p.Id, Status: holismv1.TaskStatus_TASK_STATUS_RUNNING}); err != nil {
-					t.Errorf("Update: %v", err)
+				if _, err := s.Update(ctx, &holismv1.Task{Id: tk.Id, ProjectId: p.Id, Status: holismv1.TaskStatus_TASK_STATUS_RUNNING}); !assert.NoError(t, err) {
 					return
 				}
-				if _, err := s.List(ctx, taskstore.Filter{ProjectID: p.Id}); err != nil {
-					t.Errorf("List: %v", err)
+				if _, err := s.List(ctx, taskstore.Filter{ProjectID: p.Id}); !assert.NoError(t, err) {
 					return
 				}
 			}
@@ -284,7 +239,6 @@ func TestConcurrentUse(t *testing.T) {
 		<-done
 	}
 	tasks, err := s.List(ctx, taskstore.Filter{ProjectID: p.Id})
-	if err != nil || len(tasks) != 8*50 {
-		t.Fatalf("List after concurrent writes = %d, %v", len(tasks), err)
-	}
+	require.NoError(t, err)
+	assert.Len(t, tasks, 8*50)
 }

@@ -5,6 +5,7 @@ package memory
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
 	"google.golang.org/protobuf/proto"
@@ -76,6 +77,12 @@ func (b *Bus) Publish(ctx context.Context, ev *holismv1.Event) error {
 			select {
 			case sub.ch <- out:
 			default: // slow subscriber: drop rather than block
+				slog.Warn("eventbus: subscriber buffer full, dropping event",
+					"event_id", out.Id,
+					"event_type", out.Type.String(),
+					"project_id", out.ProjectId,
+					"task_id", out.TaskId,
+				)
 			}
 		}
 	}

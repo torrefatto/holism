@@ -2,9 +2,11 @@ package rules
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	holismv1 "github.com/torrefatto/holism/api/holism/v1"
 	"github.com/torrefatto/holism/mind/internal/planner"
@@ -13,44 +15,28 @@ import (
 func TestPlanSingleTaskFromGoal(t *testing.T) {
 	p := &holismv1.Project{Id: "p1", Name: "web shop", Goal: "sell things"}
 	specs, err := New().Plan(context.Background(), p, "Write the checkout flow\nimplement payment, add tests")
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	if len(specs) != 1 {
-		t.Fatalf("got %d specs, want 1", len(specs))
-	}
-	if specs[0].Title != "Write the checkout flow" {
-		t.Fatalf("title = %q", specs[0].Title)
-	}
-	if specs[0].Description != "Write the checkout flow\nimplement payment, add tests" {
-		t.Fatalf("description = %q", specs[0].Description)
-	}
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+	assert.Equal(t, "Write the checkout flow", specs[0].Title)
+	assert.Equal(t, "Write the checkout flow\nimplement payment, add tests", specs[0].Description)
 }
 
 func TestPlanTruncatesLongTitle(t *testing.T) {
 	p := &holismv1.Project{Id: "p1", Name: "p"}
 	long := strings.Repeat("a", 200) + "\nbody"
 	specs, err := New().Plan(context.Background(), p, long)
-	if err != nil {
-		t.Fatalf("Plan: %v", err)
-	}
-	if r := []rune(specs[0].Title); len(r) != maxTitleLen {
-		t.Fatalf("title length = %d runes, want %d (%q)", len(r), maxTitleLen, specs[0].Title)
-	}
-	if !strings.HasSuffix(specs[0].Title, "…") {
-		t.Fatalf("truncated title should end with …: %q", specs[0].Title)
-	}
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+	assert.Len(t, []rune(specs[0].Title), maxTitleLen, "title should be truncated to maxTitleLen runes")
+	assert.True(t, strings.HasSuffix(specs[0].Title, "…"), "truncated title should end with …: %q", specs[0].Title)
 }
 
 func TestPlanErrors(t *testing.T) {
 	p := &holismv1.Project{Id: "p1", Name: "p"}
-	if _, err := New().Plan(context.Background(), nil, "goal"); !errors.Is(err, planner.ErrNilProject) {
-		t.Fatalf("nil project: err = %v, want ErrNilProject", err)
-	}
-	if _, err := New().Plan(context.Background(), p, ""); !errors.Is(err, planner.ErrEmptyGoal) {
-		t.Fatalf("empty goal: err = %v, want ErrEmptyGoal", err)
-	}
-	if _, err := New().Plan(context.Background(), p, "  \n\t "); !errors.Is(err, planner.ErrEmptyGoal) {
-		t.Fatalf("whitespace goal: err = %v, want ErrEmptyGoal", err)
-	}
+	_, err := New().Plan(context.Background(), nil, "goal")
+	assert.ErrorIs(t, err, planner.ErrNilProject)
+	_, err = New().Plan(context.Background(), p, "")
+	assert.ErrorIs(t, err, planner.ErrEmptyGoal)
+	_, err = New().Plan(context.Background(), p, "  \n\t ")
+	assert.ErrorIs(t, err, planner.ErrEmptyGoal)
 }
